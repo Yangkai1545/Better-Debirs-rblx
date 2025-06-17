@@ -1,0 +1,153 @@
+-- 📦 BetterDebris.lua
+-- รองรับ AddGroup + Callback หลังกลุ่มหาย
+
+local RunService = game:GetService("RunService")
+local CollectionService = game:GetService("CollectionService")
+
+local BetterDebris = {}
+BetterDebris._items = {}
+BetterDebris._groups = {}
+
+-- 🔄 Destroy individual instance
+local function destroyItem(item, data)
+	if item and item:IsDescendantOf(game) then
+		pcall(function() item:Destroy() end)
+	end
+	if data.Callback then
+		pcall(data.Callback, item)
+	end
+	BetterDebris._items[item] = nil
+
+	-- ถ้าเป็นส่วนหนึ่งของกลุ่ม
+	if data.GroupId then
+		local group = BetterDebris._groups[data.GroupId]
+		if group then
+			group.Remaining -= 1
+			if group.Remaining <= 0 then
+				if group.Callback then
+					pcall(group.Callback, group.Items)
+				end
+				BetterDebris._groups[data.GroupId] = nil
+			end
+		end
+	end
+end
+
+-- ♻️ Efficient main loop
+RunService.Heartbeat:Connect(function()
+	local now = tick()
+	for item, data in pairs(BetterDebris._items) do
+		if not item or not item:IsDescendantOf(game) then
+			destroyItem(item, data)
+			continue
+		end
+		if data.Paused then continue end
+
+		local elapsed = now - data.StartTime
+		if elapsed >= data.Lifetime then
+			destroyItem(item, data)
+		end
+	end
+end)
+
+-- ✅ Add single instance
+function BetterDebris:Add(item: Instance, lifetime: number, callback: ((Instance) -> ())?)
+	assert(typeof(item) == "Instance", "Item must be an Instance")
+	assert(typeof(lifetime) == "number" and lifetime > 0, "Lifetime must be positive")
+	self:Cancel(item)
+
+	self._items[item] = {
+		StartTime = tick(),
+		Lifetime = lifetime,
+		Callback = callback,
+		Paused = false,
+	}
+end
+
+-- ✅ Add group of instances
+function BetterDebris:AddGroup(items: {Instance}, lifetime: number, callback: (({Instance}) -> ())?)
+	assert(typeof(items) == "table", "Items must be a table")
+	assert(typeof(lifetime) == "number" and lifetime > 0, "Lifetime must be positive")
+
+	local groupId = tostring(math.random(100000,999999)) .. "_" .. tick()
+	local count = 0
+
+	for _, item in ipairs(items) do
+		if typeof(item) == "Instance" and item:IsDescendantOf(game) then
+			self._items[item] = {
+				StartTime = tick(),
+				Lifetime = lifetime,
+				Callback = nil, -- disable per-item callback
+				Paused = false,
+				GroupId = groupId,
+			}
+			count += 1
+		end
+	end
+
+	if count > 0 then
+		self._groups[groupId] = {
+			Items = items,
+			Remaining = count,
+			Callback = callback,
+		}
+	end
+end
+
+function BetterDebris:Cancel(item: Instance)
+	self._items[item] = nil
+end
+
+function BetterDebris:Pause(item: Instance)
+	local data = self._items[item]
+	if data and not data.Paused then
+		data.Paused = true
+		data.Remaining = data.Lifetime - (tick() - data.StartTime)
+	end
+end
+
+function BetterDebris:Resume(item: Instance)
+	local data = self._items[item]
+	if data and data.Paused then
+		data.Paused = false
+		data.StartTime = tick() - (data.Lifetime - data.Remaining)
+		data.Remaining = nil
+	end
+end
+
+function BetterDebris:ClearAll()
+	for item, data in pairs(self._items) do
+		destroyItem(item, data)
+	end
+end
+
+function BetterDebris:GetTrackedCount(): number
+	local count = 0
+	for _ in pairs(self._items) do
+		count += 1
+	end
+	return count
+end
+
+-- 🔖 Cleanup all tagged instances
+function BetterDebris:CleanupAllTagged(tagName: string, lifetime: number?)
+	assert(typeof(tagName) == "string", "Tag name must be a string")
+	local lifetimeToUse = lifetime or 5
+
+	local tagged = CollectionService:GetTagged(tagName)
+	for _, inst in ipairs(tagged) do
+		if inst:IsA("Instance") and inst:IsDescendantOf(game) then
+			self:Add(inst, lifetimeToUse)
+		end
+	end
+end
+
+-- 🕒 Auto-cleanup tag "CanDisappear" every 10 minutes
+task.spawn(function()
+	while true do
+		task.wait(600)
+		BetterDebris:CleanupAllTagged("CanDisappear", 5)
+	end
+end)
+
+return BetterDebris
