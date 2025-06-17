@@ -1,5 +1,4 @@
--- 📦 BetterDebris.lua
--- รองรับ AddGroup + Callback หลังกลุ่มหาย
+-- BetterDebris.lua
 
 local RunService = game:GetService("RunService")
 local CollectionService = game:GetService("CollectionService")
@@ -8,7 +7,7 @@ local BetterDebris = {}
 BetterDebris._items = {}
 BetterDebris._groups = {}
 
--- 🔄 Destroy individual instance
+--  Destroy individual instance
 local function destroyItem(item, data)
 	if item and item:IsDescendantOf(game) then
 		pcall(function() item:Destroy() end)
@@ -18,7 +17,6 @@ local function destroyItem(item, data)
 	end
 	BetterDebris._items[item] = nil
 
-	-- ถ้าเป็นส่วนหนึ่งของกลุ่ม
 	if data.GroupId then
 		local group = BetterDebris._groups[data.GroupId]
 		if group then
@@ -33,7 +31,7 @@ local function destroyItem(item, data)
 	end
 end
 
--- ♻️ Efficient main loop
+-- Efficient main loop
 RunService.Heartbeat:Connect(function()
 	local now = tick()
 	for item, data in pairs(BetterDebris._items) do
@@ -50,7 +48,7 @@ RunService.Heartbeat:Connect(function()
 	end
 end)
 
--- ✅ Add single instance
+-- Add single instance
 function BetterDebris:Add(item: Instance, lifetime: number, callback: ((Instance) -> ())?)
 	assert(typeof(item) == "Instance", "Item must be an Instance")
 	assert(typeof(lifetime) == "number" and lifetime > 0, "Lifetime must be positive")
@@ -64,7 +62,7 @@ function BetterDebris:Add(item: Instance, lifetime: number, callback: ((Instance
 	}
 end
 
--- ✅ Add group of instances
+-- Add group of instances
 function BetterDebris:AddGroup(items: {Instance}, lifetime: number, callback: (({Instance}) -> ())?)
 	assert(typeof(items) == "table", "Items must be a table")
 	assert(typeof(lifetime) == "number" and lifetime > 0, "Lifetime must be positive")
@@ -129,7 +127,7 @@ function BetterDebris:GetTrackedCount(): number
 	return count
 end
 
--- 🔖 Cleanup all tagged instances
+-- Cleanup all tagged instances
 function BetterDebris:CleanupAllTagged(tagName: string, lifetime: number?)
 	assert(typeof(tagName) == "string", "Tag name must be a string")
 	local lifetimeToUse = lifetime or 5
@@ -142,7 +140,7 @@ function BetterDebris:CleanupAllTagged(tagName: string, lifetime: number?)
 	end
 end
 
--- 🕒 Auto-cleanup tag "CanDisappear" every 10 minutes
+-- Auto-cleanup tag "CanDisappear" every 10 minutes
 task.spawn(function()
 	while true do
 		task.wait(600)
