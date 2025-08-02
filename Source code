@@ -9,6 +9,7 @@ local CONSTANTS = {
 	GROUP_ID_MAX = 999999,
 	AUTO_CLEANUP_INTERVAL = 600, -- 10 minutes
 	DEFAULT_CLEANUP_LIFETIME = 5,
+	MIN_LIFETIME = 0.01, -- Minimum allowed lifetime in seconds to avoid zero/negative values
 }
 
 -- BetterDebris singleton class
@@ -50,24 +51,72 @@ local function validateGroupItems(items)
 	return true, nil, validCount
 end
 
--- Helper function to destroy individual instances
+-- Helper function to generate unique group IDs
+-- Format: {random_number}_{timestamp}
+-- This ensures uniqueness across time and reduces collision probability
+local function generateGroupId()
+	return tostring(math.random(CONSTANTS.GROUP_ID_MIN, CONSTANTS.GROUP_ID_MAX)) .. "_" .. tick()
+end
+
+-- Helper function to create a group and add valid instances to tracking
+-- Returns the number of items actually added to the group
+local function createGroupFromItems(items, lifetime, groupId)
+	local actualCount = 0
+	local currentTime = tick()
+
+	for _, instance in ipairs(items) do
+		if validateInstance(instance) then
+			_state.items[instance] = {
+				StartTime = currentTime,
+				Lifetime = lifetime,
+				Callback = nil, -- disable per-item callback for group items
+				Paused = false,
+				GroupId = groupId,
+			}
+			actualCount += 1
+		end
+	end
+
+	return actualCount
+end
+
+-- Helper function to destroy individual instances and manage state
+-- Side effects:
+-- 1. Destroys the instance using item:Destroy()
+-- 2. Executes per-item callback if provided
+-- 3. Removes item from _state.items tracking table
+-- 4. Updates group state if item belongs to a group
+-- 5. Executes group callback and cleans up group when all items are processed
 local function destroyItem(item, data)
 	if item and item:IsDescendantOf(game) then
-		pcall(function() item:Destroy() end)
+		local success, errorMessage = pcall(function() item:Destroy() end)
+		if not success then
+			warn("BetterDebris: Failed to destroy item " .. tostring(item) .. ": " .. tostring(errorMessage))
+		end
 	end
 	if data.Callback then
-		pcall(data.Callback, item)
+		local success, errorMessage = pcall(data.Callback, item)
+		if not success then
+			warn("BetterDebris: Callback execution failed for item " .. tostring(item) .. ": " .. tostring(errorMessage))
+		end
 	end
+	
+	-- Remove item from tracking (explicit state modification)
 	_state.items[item] = nil
 
+	-- Handle group state updates if item belongs to a group
 	if data.GroupId then
 		local group = _state.groups[data.GroupId]
 		if group then
 			group.Remaining -= 1
 			if group.Remaining <= 0 then
 				if group.Callback then
-					pcall(group.Callback, group.Items)
+					local success, errorMessage = pcall(group.Callback, group.Items)
+					if not success then
+						warn("BetterDebris: Group callback execution failed for group " .. tostring(data.GroupId) .. ": " .. tostring(errorMessage))
+					end
 				end
+				-- Clean up completed group (explicit state modification)
 				_state.groups[data.GroupId] = nil
 			end
 		end
@@ -151,8 +200,8 @@ function BetterDebris:Add(item: Instance, lifetime: number, callback: ((Instance
 		return false
 	end
 	
-	if typeof(lifetime) ~= "number" or lifetime <= 0 then
-		warn("BetterDebris:Add - Lifetime must be a positive number, got " .. tostring(lifetime))
+	if typeof(lifetime) ~= "number" or lifetime < CONSTANTS.MIN_LIFETIME then
+		warn("BetterDebris:Add - Lifetime must be a positive number >= " .. CONSTANTS.MIN_LIFETIME .. ", got " .. tostring(lifetime))
 		return false
 	end
 	
@@ -181,8 +230,8 @@ function BetterDebris:AddGroup(items: {Instance}, lifetime: number, callback: ((
 		return false
 	end
 	
-	if typeof(lifetime) ~= "number" or lifetime <= 0 then
-		warn("BetterDebris:AddGroup - Lifetime must be a positive number, got " .. tostring(lifetime))
+	if typeof(lifetime) ~= "number" or lifetime < CONSTANTS.MIN_LIFETIME then
+		warn("BetterDebris:AddGroup - Lifetime must be a positive number >= " .. CONSTANTS.MIN_LIFETIME .. ", got " .. tostring(lifetime))
 		return false
 	end
 	
@@ -191,24 +240,14 @@ function BetterDebris:AddGroup(items: {Instance}, lifetime: number, callback: ((
 		return false
 	end
 
-	-- Generate group ID with documented constants
-	local groupId = tostring(math.random(CONSTANTS.GROUP_ID_MIN, CONSTANTS.GROUP_ID_MAX)) .. "_" .. tick()
-	local actualCount = 0
-
-	for _, instance in ipairs(items) do
-		if validateInstance(instance) then
-			_state.items[instance] = {
-				StartTime = tick(),
-				Lifetime = lifetime,
-				Callback = nil, -- disable per-item callback for group items
-				Paused = false,
-				GroupId = groupId,
-			}
-			actualCount += 1
-		end
-	end
+	-- Generate unique group ID using helper function
+	local groupId = generateGroupId()
+	
+	-- Create group and add valid instances to tracking
+	local actualCount = createGroupFromItems(items, lifetime, groupId)
 
 	if actualCount > 0 then
+		-- Register the group for tracking
 		_state.groups[groupId] = {
 			Items = items,
 			Remaining = actualCount,
