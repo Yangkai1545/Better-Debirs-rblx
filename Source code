@@ -3,11 +3,54 @@
 local RunService = game:GetService("RunService")
 local CollectionService = game:GetService("CollectionService")
 
-local BetterDebris = {}
-BetterDebris._items = {}
-BetterDebris._groups = {}
+-- Constants
+local CONSTANTS = {
+	GROUP_ID_MIN = 100000,
+	GROUP_ID_MAX = 999999,
+	AUTO_CLEANUP_INTERVAL = 600, -- 10 minutes
+	DEFAULT_CLEANUP_LIFETIME = 5,
+}
 
---  Destroy individual instance
+-- BetterDebris singleton class
+local BetterDebris = {}
+BetterDebris.__index = BetterDebris
+
+-- Private state for the singleton instance
+local _instance = nil
+local _state = {
+	items = {},
+	groups = {},
+	isDestroyed = false,
+	autoCleanupEnabled = false,
+	heartbeatConnection = nil,
+	autoCleanupTask = nil,
+}
+
+-- Validation helper functions
+local function validateInstance(item)
+	return typeof(item) == "Instance" and item:IsDescendantOf(game)
+end
+
+local function validateGroupItems(items)
+	if typeof(items) ~= "table" then
+		return false, "Items must be a table"
+	end
+	
+	local validCount = 0
+	for _, item in ipairs(items) do
+		if validateInstance(item) then
+			validCount += 1
+		end
+	end
+	
+	if validCount == 0 then
+		return false, "No valid instances found in the group"
+	end
+	
+	return true, nil, validCount
+end
+
+-- Helper function to destroy individual instances
 local function destroyItem(item, data)
 	if item and item:IsDescendantOf(game) then
 		pcall(function() item:Destroy() end)
@@ -15,89 +58,174 @@ local function destroyItem(item, data)
 	if data.Callback then
 		pcall(data.Callback, item)
 	end
-	BetterDebris._items[item] = nil
+	_state.items[item] = nil
 
 	if data.GroupId then
-		local group = BetterDebris._groups[data.GroupId]
+		local group = _state.groups[data.GroupId]
 		if group then
 			group.Remaining -= 1
 			if group.Remaining <= 0 then
 				if group.Callback then
 					pcall(group.Callback, group.Items)
 				end
-				BetterDebris._groups[data.GroupId] = nil
+				_state.groups[data.GroupId] = nil
 			end
 		end
 	end
 end
 
--- Efficient main loop
-RunService.Heartbeat:Connect(function()
-	local now = tick()
-	for item, data in pairs(BetterDebris._items) do
+-- Helper function to collect expired items
+local function collectExpiredItems(currentTime)
+	local expiredItems = {}
+	
+	for item, data in pairs(_state.items) do
 		if not item or not item:IsDescendantOf(game) then
-			destroyItem(item, data)
-			continue
-		end
-		if data.Paused then continue end
-
-		local elapsed = now - data.StartTime
-		if elapsed >= data.Lifetime then
-			destroyItem(item, data)
+			table.insert(expiredItems, {item = item, data = data, reason = "invalid"})
+		elseif not data.Paused then
+			local elapsed = currentTime - data.StartTime
+			if elapsed >= data.Lifetime then
+				table.insert(expiredItems, {item = item, data = data, reason = "expired"})
+			end
 		end
 	end
-end)
+	
+	return expiredItems
+end
 
--- Add single instance
+-- Helper function to remove expired items
+local function removeExpiredItems(expiredItems)
+	for _, expiredItem in ipairs(expiredItems) do
+		destroyItem(expiredItem.item, expiredItem.data)
+	end
+end
+
+-- Main processing loop (split into smaller functions)
+local function processItems()
+	if _state.isDestroyed then
+		return
+	end
+	
+	local currentTime = tick()
+	local expiredItems = collectExpiredItems(currentTime)
+	removeExpiredItems(expiredItems)
+end
+
+-- Singleton constructor
+function BetterDebris.new()
+	if _instance then
+		return _instance
+	end
+	
+	_instance = setmetatable({}, BetterDebris)
+	return _instance
+end
+
+-- Get the singleton instance
+function BetterDebris.getInstance()
+	return _instance or BetterDebris.new()
+end
+
+-- Initialize the debris system
+function BetterDebris:Initialize(config)
+	config = config or {}
+	
+	if _state.heartbeatConnection then
+		return self -- Already initialized
+	end
+	
+	-- Start the main processing loop
+	_state.heartbeatConnection = RunService.Heartbeat:Connect(processItems)
+	
+	-- Enable auto-cleanup if requested
+	if config.enableAutoCleanup then
+		self:EnableAutoCleanup()
+	end
+	
+	return self
+end
+
+-- Add single instance with improved error handling
 function BetterDebris:Add(item: Instance, lifetime: number, callback: ((Instance) -> ())?)
-	assert(typeof(item) == "Instance", "Item must be an Instance")
-	assert(typeof(lifetime) == "number" and lifetime > 0, "Lifetime must be positive")
+	if typeof(item) ~= "Instance" then
+		warn("BetterDebris:Add - Item must be an Instance, got " .. typeof(item))
+		return false
+	end
+	
+	if typeof(lifetime) ~= "number" or lifetime <= 0 then
+		warn("BetterDebris:Add - Lifetime must be a positive number, got " .. tostring(lifetime))
+		return false
+	end
+	
+	if _state.isDestroyed then
+		warn("BetterDebris:Add - Cannot add items to destroyed debris system")
+		return false
+	end
+	
 	self:Cancel(item)
 
-	self._items[item] = {
+	_state.items[item] = {
 		StartTime = tick(),
 		Lifetime = lifetime,
 		Callback = callback,
 		Paused = false,
 	}
+	
+	return true
 end
 
--- Add group of instances
+-- Add group of instances with extracted validation
 function BetterDebris:AddGroup(items: {Instance}, lifetime: number, callback: (({Instance}) -> ())?)
-	assert(typeof(items) == "table", "Items must be a table")
-	assert(typeof(lifetime) == "number" and lifetime > 0, "Lifetime must be positive")
+	local isValid, errorMessage, validCount = validateGroupItems(items)
+	if not isValid then
+		warn("BetterDebris:AddGroup - " .. errorMessage)
+		return false
+	end
+	
+	if typeof(lifetime) ~= "number" or lifetime <= 0 then
+		warn("BetterDebris:AddGroup - Lifetime must be a positive number, got " .. tostring(lifetime))
+		return false
+	end
+	
+	if _state.isDestroyed then
+		warn("BetterDebris:AddGroup - Cannot add items to destroyed debris system")
+		return false
+	end
 
-	local groupId = tostring(math.random(100000,999999)) .. "_" .. tick()
-	local count = 0
+	-- Generate group ID with documented constants
+	local groupId = tostring(math.random(CONSTANTS.GROUP_ID_MIN, CONSTANTS.GROUP_ID_MAX)) .. "_" .. tick()
+	local actualCount = 0
 
-	for _, item in ipairs(items) do
-		if typeof(item) == "Instance" and item:IsDescendantOf(game) then
-			self._items[item] = {
+	for _, instance in ipairs(items) do
+		if validateInstance(instance) then
+			_state.items[instance] = {
 				StartTime = tick(),
 				Lifetime = lifetime,
-				Callback = nil, -- disable per-item callback
+				Callback = nil, -- disable per-item callback for group items
 				Paused = false,
 				GroupId = groupId,
 			}
-			count += 1
+			actualCount += 1
 		end
 	end
 
-	if count > 0 then
-		self._groups[groupId] = {
+	if actualCount > 0 then
+		_state.groups[groupId] = {
 			Items = items,
-			Remaining = count,
+			Remaining = actualCount,
 			Callback = callback,
 		}
+		return true
 	end
+	
+	return false
 end
 
 function BetterDebris:Cancel(item: Instance)
-	self._items[item] = nil
+	_state.items[item] = nil
 end
 
 function BetterDebris:Pause(item: Instance)
-	local data = self._items[item]
+	local data = _state.items[item]
 	if data and not data.Paused then
 		data.Paused = true
 		data.Remaining = data.Lifetime - (tick() - data.StartTime)
@@ -105,7 +233,7 @@ function BetterDebris:Pause(item: Instance)
 end
 
 function BetterDebris:Resume(item: Instance)
-	local data = self._items[item]
+	local data = _state.items[item]
 	if data and data.Paused then
 		data.Paused = false
 		data.StartTime = tick() - (data.Lifetime - data.Remaining)
@@ -114,38 +242,86 @@ function BetterDebris:Resume(item: Instance)
 end
 
 function BetterDebris:ClearAll()
-	for item, data in pairs(self._items) do
+	for item, data in pairs(_state.items) do
 		destroyItem(item, data)
 	end
 end
 
 function BetterDebris:GetTrackedCount(): number
 	local count = 0
-	for _ in pairs(self._items) do
+	for _ in pairs(_state.items) do
 		count += 1
 	end
 	return count
 end
 
--- Cleanup all tagged instances
+-- Cleanup all tagged instances with improved variable naming
 function BetterDebris:CleanupAllTagged(tagName: string, lifetime: number?)
-	assert(typeof(tagName) == "string", "Tag name must be a string")
-	local lifetimeToUse = lifetime or 5
+	if typeof(tagName) ~= "string" then
+		warn("BetterDebris:CleanupAllTagged - Tag name must be a string, got " .. typeof(tagName))
+		return false
+	end
+	
+	local lifetimeToUse = lifetime or CONSTANTS.DEFAULT_CLEANUP_LIFETIME
 
-	local tagged = CollectionService:GetTagged(tagName)
-	for _, inst in ipairs(tagged) do
-		if inst:IsA("Instance") and inst:IsDescendantOf(game) then
-			self:Add(inst, lifetimeToUse)
+	local taggedInstances = CollectionService:GetTagged(tagName)
+	for _, instance in ipairs(taggedInstances) do
+		if instance:IsA("Instance") and instance:IsDescendantOf(game) then
+			self:Add(instance, lifetimeToUse)
 		end
 	end
+	
+	return true
 end
 
--- Auto-cleanup tag "CanDisappear" every 10 minutes
-task.spawn(function()
-	while true do
-		task.wait(600)
-		BetterDebris:CleanupAllTagged("CanDisappear", 5)
+-- Enable auto-cleanup system (opt-in)
+function BetterDebris:EnableAutoCleanup()
+	if _state.autoCleanupEnabled then
+		return self
 	end
-end)
+	
+	_state.autoCleanupEnabled = true
+	_state.autoCleanupTask = task.spawn(function()
+		while _state.autoCleanupEnabled and not _state.isDestroyed do
+			task.wait(CONSTANTS.AUTO_CLEANUP_INTERVAL)
+			if _state.autoCleanupEnabled and not _state.isDestroyed then
+				self:CleanupAllTagged("CanDisappear", CONSTANTS.DEFAULT_CLEANUP_LIFETIME)
+			end
+		end
+	end)
+	
+	return self
+end
 
-return BetterDebris
+-- Disable auto-cleanup system
+function BetterDebris:DisableAutoCleanup()
+	_state.autoCleanupEnabled = false
+	if _state.autoCleanupTask then
+		task.cancel(_state.autoCleanupTask)
+		_state.autoCleanupTask = nil
+	end
+	return self
+end
+
+-- Destroy the debris system
+function BetterDebris:Destroy()
+	_state.isDestroyed = true
+	
+	if _state.heartbeatConnection then
+		_state.heartbeatConnection:Disconnect()
+		_state.heartbeatConnection = nil
+	end
+	
+	self:DisableAutoCleanup()
+	self:ClearAll()
+	
+	_instance = nil
+end
+
+-- Create and return the singleton instance
+local debrisInstance = BetterDebris.new()
+
+-- Auto-initialize with basic setup (backwards compatibility)
+debrisInstance:Initialize()
+
+return debrisInstance
