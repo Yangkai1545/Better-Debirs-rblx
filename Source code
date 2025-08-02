@@ -7,8 +7,10 @@ local CollectionService = game:GetService("CollectionService")
 local CONSTANTS = {
 	GROUP_ID_MIN = 100000,
 	GROUP_ID_MAX = 999999,
-	AUTO_CLEANUP_INTERVAL = 600, -- 10 minutes
-	DEFAULT_CLEANUP_LIFETIME = 5,
+	AUTO_CLEANUP_INTERVAL = 600, -- 10 minutes in seconds
+	DEFAULT_CLEANUP_LIFETIME = 5, -- seconds
+	MIN_LIFETIME = 0.01, -- minimum allowed lifetime in seconds
+	GROUP_ID_SEPARATOR = "_", -- separator between random number and timestamp
 }
 
 -- BetterDebris singleton class
@@ -50,24 +52,106 @@ local function validateGroupItems(items)
 	return true, nil, validCount
 end
 
--- Helper function to destroy individual instances
+-- Helper function to generate a unique group ID
+-- Format: {RandomNumber}_{Timestamp} - ensures uniqueness across time and prevents collisions
+local function generateGroupId()
+	local randomPart = tostring(math.random(CONSTANTS.GROUP_ID_MIN, CONSTANTS.GROUP_ID_MAX))
+	local timestampPart = tostring(tick())
+	return randomPart .. CONSTANTS.GROUP_ID_SEPARATOR .. timestampPart
+end
+
+-- Helper function to create and register a debris group
+local function createDebrisGroup(items, lifetime, callback, groupId)
+	local actualCount = 0
+	
+	for _, instance in ipairs(items) do
+		if validateInstance(instance) then
+			_state.items[instance] = {
+				StartTime = tick(),
+				Lifetime = lifetime,
+				Callback = nil, -- disable per-item callback for group items
+				Paused = false,
+				GroupId = groupId,
+			}
+			actualCount += 1
+		end
+	end
+
+	if actualCount > 0 then
+		_state.groups[groupId] = {
+			Items = items,
+			Remaining = actualCount,
+			Callback = callback,
+		}
+		return true, actualCount
+	end
+	
+	return false, 0
+end
+
+-- Helper function to safely call a function and log errors
+local function safeCall(func, ...)
+	local success, error = pcall(func, ...)
+	if not success then
+		warn("BetterDebris: Error during callback execution - " .. tostring(error))
+	end
+	return success
+end
+
+-- Helper function to safely destroy an instance
+local function safeDestroy(item)
+	if not item or not item:IsDescendantOf(game) then
+		return false
+	end
+	
+	local success, error = pcall(function() 
+		item:Destroy() 
+	end)
+	
+	if not success then
+		warn("BetterDebris: Failed to destroy item " .. tostring(item) .. " - " .. tostring(error))
+		-- Fallback: try to remove from parent if destroy fails
+		pcall(function()
+			if item.Parent then
+				item.Parent = nil
+			end
+		end)
+	end
+	
+	return success
+end
+
+-- Helper function to destroy individual instances with explicit state modifications
+-- Side effects: 
+-- - Removes item from _state.items
+-- - Decrements group remaining count if item belongs to a group
+-- - Removes group from _state.groups if no items remain
+-- - Executes callbacks for item and/or group completion
 local function destroyItem(item, data)
-	if item and item:IsDescendantOf(game) then
-		pcall(function() item:Destroy() end)
+	-- Attempt to destroy the instance safely
+	if item then
+		safeDestroy(item)
 	end
+	
+	-- Execute item callback if present
 	if data.Callback then
-		pcall(data.Callback, item)
+		safeCall(data.Callback, item)
 	end
+	
+	-- Remove item from tracking (explicit state modification)
 	_state.items[item] = nil
 
+	-- Handle group lifecycle if item belongs to a group
 	if data.GroupId then
 		local group = _state.groups[data.GroupId]
 		if group then
 			group.Remaining -= 1
 			if group.Remaining <= 0 then
+				-- Execute group completion callback
 				if group.Callback then
-					pcall(group.Callback, group.Items)
+					safeCall(group.Callback, group.Items)
 				end
+				-- Remove completed group from tracking (explicit state modification)
 				_state.groups[data.GroupId] = nil
 			end
 		end
@@ -151,8 +235,8 @@ function BetterDebris:Add(item: Instance, lifetime: number, callback: ((Instance
 		return false
 	end
 	
-	if typeof(lifetime) ~= "number" or lifetime <= 0 then
-		warn("BetterDebris:Add - Lifetime must be a positive number, got " .. tostring(lifetime))
+	if typeof(lifetime) ~= "number" or lifetime < CONSTANTS.MIN_LIFETIME then
+		warn("BetterDebris:Add - Lifetime must be at least " .. CONSTANTS.MIN_LIFETIME .. " seconds, got " .. tostring(lifetime))
 		return false
 	end
 	
@@ -173,16 +257,17 @@ function BetterDebris:Add(item: Instance, lifetime: number, callback: ((Instance
 	return true
 end
 
--- Add group of instances with extracted validation
+-- Add group of instances with extracted validation and creation logic
 function BetterDebris:AddGroup(items: {Instance}, lifetime: number, callback: (({Instance}) -> ())?)
+	-- Validate input parameters
 	local isValid, errorMessage, validCount = validateGroupItems(items)
 	if not isValid then
 		warn("BetterDebris:AddGroup - " .. errorMessage)
 		return false
 	end
 	
-	if typeof(lifetime) ~= "number" or lifetime <= 0 then
-		warn("BetterDebris:AddGroup - Lifetime must be a positive number, got " .. tostring(lifetime))
+	if typeof(lifetime) ~= "number" or lifetime < CONSTANTS.MIN_LIFETIME then
+		warn("BetterDebris:AddGroup - Lifetime must be at least " .. CONSTANTS.MIN_LIFETIME .. " seconds, got " .. tostring(lifetime))
 		return false
 	end
 	
@@ -191,33 +276,11 @@ function BetterDebris:AddGroup(items: {Instance}, lifetime: number, callback: ((
 		return false
 	end
 
-	-- Generate group ID with documented constants
-	local groupId = tostring(math.random(CONSTANTS.GROUP_ID_MIN, CONSTANTS.GROUP_ID_MAX)) .. "_" .. tick()
-	local actualCount = 0
-
-	for _, instance in ipairs(items) do
-		if validateInstance(instance) then
-			_state.items[instance] = {
-				StartTime = tick(),
-				Lifetime = lifetime,
-				Callback = nil, -- disable per-item callback for group items
-				Paused = false,
-				GroupId = groupId,
-			}
-			actualCount += 1
-		end
-	end
-
-	if actualCount > 0 then
-		_state.groups[groupId] = {
-			Items = items,
-			Remaining = actualCount,
-			Callback = callback,
-		}
-		return true
-	end
+	-- Create the debris group using helper function
+	local groupId = generateGroupId()
+	local success, actualCount = createDebrisGroup(items, lifetime, callback, groupId)
 	
-	return false
+	return success
 end
 
 function BetterDebris:Cancel(item: Instance)
